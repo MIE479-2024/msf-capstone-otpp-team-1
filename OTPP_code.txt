@@ -16,6 +16,8 @@ class Library:
         self.benchmark = [] #dts, liquidity, returns, variance, duration
         self.constraint_priority = 0
         self.constraints = {'DTS':[], 'Duration':[], 'Weight':[], 'Liquidity':[], 'Cardinality':[]} #priority, level, name, lowerbound, upperbound
+      
+
         # DTS
             # Portfolio
             # Sector
@@ -45,12 +47,26 @@ class Library:
         with open(file, newline='') as csvfile:
             datarows = [] #ISIN, name, year-maturity, coupon, sector, oas, liq_score, exp_return, std_dev, date, duration, bid_price, ask_price
             spamreader = csv.reader(csvfile, delimiter=' ', quotechar='|')
+            next(spamreader, None)
             for row in spamreader:
+                
                 line = ' '.join(row).split(',')
+                
+                line[2] = datetime.strptime(line[2], '%Y-%m-%d').date()
+                line[9] = datetime.strptime(line[9], '%Y-%m-%d').date()
                 datarows.append(line)
-        self.raw_data = datarows[1:]
+        self.raw_data = datarows
         self.sectors = set([a[4] for a in self.raw_data])
         self.create_working_data()
+
+    def get_prev_portfolio_weights(self):
+        # TBD, currently defined as equally weighted portfolio
+        res = [a + [1/len(self.working_data)] for a in self.working_data ]
+        return res
+
+    def define_prev_portfolio_weights(self):
+        self.prev_portfolio_weights = self.get_prev_portfolio_weights()
+
 
     def clear_data(self):
         self.working_data = []
@@ -66,9 +82,21 @@ class Library:
         max_date = max(a[9] for a in self.raw_data)
         self.raw_data_recent = [a for a in self.raw_data if a[9] == max_date]
 
+    def define_maturity_bucket(self,data):
+        year_dividers = [3, 8] # bucket ranges
+        #for i in data:
+            # TBD need to bin (can be pandas cut)
+            
     def create_working_data(self):
-        #issuer, sector, oas, liq_score, exp_return, variance, duration, bondname
-        self.working_data = [[a[1], a[4], float(a[5]), float(a[6]), float(a[7]), float(a[8]) ** 2, float(a[10]), a[0]] for a in self.raw_data_recent]
+        #issuer, sector, oas, liq_score, exp_return, variance, duration, bondname, date, maturity date, years-to-maturity, bid_price, ask_price
+        self.working_data = [[a[1], a[4], float(a[5]), float(a[6]), float(a[7]), float(a[8]) ** 2, float(a[10]), a[0], a[9], a[2], (a[2]-a[9]).days / 365, float(a[11]), float(a[12])] for a in self.raw_data]
+        
+        # add t_cost 
+        self.working_data = [a + [max(0,(a[12] - a[11])/(a[12] + a[11]))] for a in self.working_data]
+        
+        # get the previous portfolio weight
+        self.working_data  = self.get_prev_portfolio_weights() # get the previous portfolio weights, now in index 14
+        
         self.data_length = len(self.working_data)
 
     def filter_data_by_sector(self, category):
@@ -83,6 +111,8 @@ class Library:
         self.working_data = [a for a in self.working_data if a[4] >= 0]
         self.data_length = len(self.working_data)
 
+
+     
     def set_benchmark(self, dataset):
         total_return = 0
         total_liquidity = 0
@@ -118,7 +148,8 @@ class Library:
     def add_cash(self):
         with_cash = copy.deepcopy(self.working_data)
         # with_cash = [a for a in with_cash if a[4] >= 0]
-        with_cash.append(['short_cash', '', 0, 10, 0, 0, 0])
+        
+        with_cash.append(['short_cash', '', 0, 10, 0, 0, 0,0,0,0,0,0,0,0,0])
         # with_cash.append(['long_cash', '', 0, 10, 0, 0, max([a[6] for a in self.working_data])])
         return with_cash
 
@@ -148,9 +179,10 @@ class Library:
                 self.constraints[metric].append([self.constraint_priority, level, name, lowerbound, upperbound])
                 self.constraint_priority += 1
 
-    def optimize(self, duration_slack):
-
-        self.benchmark = set_benchmark(self.working_data)
+    def optimize(self):
+        
+        
+        self.benchmark = self.set_benchmark(self.working_data)
 
         dataset = self.add_cash()
 
@@ -158,6 +190,8 @@ class Library:
 
         weights = []
         binary = []
+        turnover_change=[]
+        transaction_dummy=[]
 
         for i in range(len(dataset)):
             weight_var = model.addVar(name=f"{i}~~{dataset[i][0]}", lb=0.0, ub=1.0)
@@ -165,19 +199,34 @@ class Library:
             cardinal_var = model.addVar(name=f"{i}|{dataset[i][0]}", vtype=GRB.BINARY)
             binary.append(cardinal_var)
 
+
             #Binary Inequality
             model.addConstr(weight_var <= cardinal_var)
             model.addConstr(weight_var * 10**9 >= cardinal_var)
 
+
+        # T cost
+
+        transaction_dummy = model.addVars(len(dataset),name=[a[0] for a in dataset][i], lb=0.0, ub=1.0)
+        turnover_change = model.addVars(len(dataset),name=[a[0] for a in dataset][i], lb=0.0, ub=1.0)
+
+        
+        model.addConstrs((weights[i] - ([a[14] for a in dataset][i])  == turnover_change[i]  for i in range(len(weights))), "turnover")
+        
+        for i in range(len(dataset)):
+            model.addGenConstrAbs(transaction_dummy[i],turnover_change[i])
+
         #Set Objective
-        model.setObjective(sum(weights[i] * [a[4] for a in dataset][i] for i in range(len(dataset))),
+        model.setObjective(sum((weights[i] * [a[4] for a in dataset][i]  - transaction_dummy[i] * [a[13] for a in dataset][i] ) for i in range(len(dataset))),
             GRB.MAXIMIZE
         )
-
+        #model.getObjective()
         #Full Investment
         model.addConstr(sum(weights[i] for i in range(len(dataset))) == 1.0, "full_investment")
-
-        for metric, constraints in self.constraints:
+        print(self.constraints)
+        for metric, constraints in self.constraints.items():
+            if len(constraints) == 0:
+                continue # if no constraints defined, skip
             if metric == 'DTS':
                 for constraint in constraints:
                     if constraint[1] == 'Portfolio':
@@ -185,7 +234,7 @@ class Library:
                             sum(weights[i] * [a[2]*a[6] for a in dataset][i] for i in range(len(dataset))) <= self.benchmark[0] + constraint[-1], f"Constraint_{constraint[0]}"
                         )
                     else:
-                        sector_benchmark = benchmark = set_benchmark([a for a in dataset if a[1] == constraint[2]])
+                        sector_benchmark = benchmark = self.set_benchmark([a for a in dataset if a[1] == constraint[2]])
                         sector_weight = sum(weights[i] for i in range(len(dataset)) if dataset[i][1] == constraint[2])
                         if sector_weight > 0:
                             model.addConstr(
@@ -203,7 +252,7 @@ class Library:
                         )
 
                     else:
-                        sector_benchmark = benchmark = set_benchmark([a for a in dataset if a[1] == constraint[2]])
+                        sector_benchmark = benchmark = self.set_benchmark([a for a in dataset if a[1] == constraint[2]])
                         sector_weight = sum(weights[i] for i in range(len(dataset)) if dataset[i][1] == constraint[2])
                         if sector_weight > 0:
                             model.addConstr(
@@ -245,8 +294,10 @@ class Library:
                     model.addConstr(
                         sum(binary[i] for i in range(len(dataset)) if dataset[i] == constraint[2]) <= constraint[-1], f"Constraint_{constraint[0]}"
                         )
-
-        model.optimize()
+        # view constraints
+        model_constraints = model.getConstrs()
+        for m in model_constraints:
+            print(m)
 
         if model.status == GRB.OPTIMAL:
             print("Optimal solution found.")
@@ -256,3 +307,4 @@ class Library:
             print("Model is infeasible. Checking constraints...")
             model.computeIIS()
             model.write("model.ilp")
+
